@@ -57,8 +57,41 @@ public class CodeReviewService {
 
             Map<String, Object> diff = (Map<String, Object>) diffResponse.get("data");
 
-            // 3. AI分析
-            String prompt = buildReviewPrompt(prInfo, diff);
+            // 3. 获取完整文件内容（增强上下文）
+            List<Map<String, Object>> files = (List<Map<String, Object>>) diff.get("files");
+            StringBuilder fileContents = new StringBuilder();
+            
+            for (Map<String, Object> file : files) {
+                String filename = (String) file.get("filename");
+                String status = (String) file.get("status");
+                
+                // 只获取 Java 文件的完整内容，且不是删除的文件
+                if (filename.endsWith(".java") && !"removed".equals(status)) {
+                    try {
+                        Map<String, Object> contentResponse = mcpClient.call(
+                                "get_file_content",
+                                Map.of(
+                                        "repo", repo,
+                                        "path", filename,
+                                        "ref", prInfo.get("head_sha") // 使用 PR 的最新 commit SHA
+                                ),
+                                Map.of("github_token", githubToken)
+                        );
+
+                        if (isSuccess(contentResponse)) {
+                            Map<String, Object> data = (Map<String, Object>) contentResponse.get("data");
+                            String content = (String) data.get("content");
+                            fileContents.append("\n========== 文件: ").append(filename).append(" ==========\n");
+                            fileContents.append(content).append("\n");
+                        }
+                    } catch (Exception e) {
+                        log.warn("获取文件内容失败: {}", filename, e);
+                    }
+                }
+            }
+
+            // 4. AI分析
+            String prompt = buildReviewPrompt(prInfo, diff, fileContents.toString());
             String aiReview = aiAgent.chat(1L, prompt);
 
             log.info("AI分析完成，准备提交评审");
@@ -90,12 +123,18 @@ public class CodeReviewService {
         return Boolean.TRUE.equals(response.get("success"));
     }
 
-    private String buildReviewPrompt(Map<String, Object> prInfo, Map<String, Object> diff) {
+    private String buildReviewPrompt(Map<String, Object> prInfo, Map<String, Object> diff, String fullFileContents) {
         StringBuilder prompt = new StringBuilder();
         prompt.append("请作为资深代码审查专家，分析以下Pull Request：\n\n");
         prompt.append("PR标题：").append(prInfo.get("title")).append("\n");
         prompt.append("作者：").append(prInfo.get("author")).append("\n");
         prompt.append("描述：").append(prInfo.get("description")).append("\n\n");
+        
+        if (fullFileContents != null && !fullFileContents.isEmpty()) {
+            prompt.append("为了帮助你更好地理解上下文，以下是修改文件的完整内容：\n");
+            prompt.append(fullFileContents).append("\n\n");
+        }
+        
         prompt.append("代码变更统计：\n");
         prompt.append("- 新增行数：").append(diff.get("total_additions")).append("\n");
         prompt.append("- 删除行数：").append(diff.get("total_deletions")).append("\n");
@@ -103,7 +142,7 @@ public class CodeReviewService {
 
         // 添加文件变更详情
         List<Map<String, Object>> files = (List<Map<String, Object>>) diff.get("files");
-        prompt.append("文件变更详情：\n");
+        prompt.append("文件变更详情（Diff）：\n");
         for (Map<String, Object> file : files) {
             prompt.append("\n文件：").append(file.get("filename")).append("\n");
             prompt.append("状态：").append(file.get("status")).append("\n");
@@ -111,7 +150,7 @@ public class CodeReviewService {
             prompt.append(file.get("patch")).append("\n");
         }
 
-        prompt.append("\n请作为Java资深专家，重点从以下Java特定角度进行深度分析：\n");
+        prompt.append("\n请作为Java资深专家，结合完整文件上下文和Diff，重点从以下Java特定角度进行深度分析：\n");
         prompt.append("1. Java并发安全：\n");
         prompt.append("   - 检查是否存在线程安全问题（如HashMap在多线程环境下的使用）\n");
         prompt.append("   - 检查锁的使用是否合理（死锁风险、锁粒度过大）\n");
